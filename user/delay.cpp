@@ -6,6 +6,7 @@ This software is released under the MIT License, see LICENSE.txt.
 #include "userdelfx.h"
 #include "buffer_ops.h"
 #include "LCWDelayBuffer.h"
+#include "LCWPow2.h"
 
 // サンプリングバッファが2^18もあれば、BPM=30, time=x1.0に対応できる
 // 最低でも96k個（= 48000 x 2）は欲しいが、130k個もあるので大丈夫
@@ -62,8 +63,7 @@ void DELFX_INIT(uint32_t platform, uint32_t api)
     buf->size = LCW_DELAY_SAMPLING_BUFFER_SIZE;
     buf->mask = LCW_DELAY_SAMPLING_BUFFER_SIZE - 1;
     buf->pointer = 0;
-    // 16回で十分に小さくなる設定
-    buf->fbGain = LCW_SQ7_24( 0.649381631576211 );
+    buf->fbGain = 0; // あとで
     buf->offset = 0; // あとで
     buf->out = 0;
   }
@@ -74,17 +74,26 @@ void DELFX_INIT(uint32_t platform, uint32_t api)
   s_inputGain = 0.f;
 }
 
-__fast_inline uint32_t calcDelaySamples(float bpm, float param)
+__fast_inline uint32_t calcDelaySamples(float bpm, float delayTime)
 {
-  // 0.f-1.f -> 0..(n-1)
-  const uint32_t i = (uint32_t)((param * (LCW_DELAY_TIME_PARAMS - 1)) + .5f);
-  const float delayTime = delayTimeParams[i];
   // bps = bpm / 60
   // n = bps / delayTime
   // delaySamples = samplingRate / n
   //              = (samplingRate * delayTime) / bps
   //              = (samplingRate * delayTime * 60) / bpm
   return (uint32_t)((LCW_DELAY_SAMPLING_RATE * delayTime * 60.f) / bpm);
+}
+
+__fast_inline int32_t calcFbGain(float bpm, float delayTime)
+{
+  // samples = samplingRate / ((bpm / 60) / delayTime)
+  // n = (samplingRate * time) / samples
+  //   = (time * (bpm / 60)) / param
+  // gain = 2 ^ (log2(0.001) / n)
+  const float log2_0_001 = -9.965784284662087;
+  const float time = 3.f; // time(sec)で十分に小さくなる設定
+  const float n = (time * bpm) / (delayTime * 60.f);
+  return LCWPow2( LCW_SQ7_24(log2_0_001 / n) );
 }
 
 __fast_inline int32_t delayMain(LCWDelayBuffer *p, int32_t in)
@@ -106,8 +115,14 @@ void DELFX_PROCESS(float *xn, uint32_t frames)
   float bpm = fx_get_bpmf();
   bpm = clampfsel( (float)LCW_DELAY_BPM_MIN, bpm, (float)LCW_DELAY_BPM_MAX );
 
-  delayBuffers[0].offset = calcDelaySamples( bpm, s_time );
-  delayBuffers[1].offset = calcDelaySamples( bpm, s_depth );
+  const float params[] = { s_time, s_depth };
+  for (int32_t i=0; i<LCW_DELAY_BUFFER_MAX; i++) {
+    // 0.f-1.f -> 0..(n-1)
+    const uint32_t j = (uint32_t)((params[i] * (LCW_DELAY_TIME_PARAMS - 1)) + .5f);
+    const float delayTime = delayTimeParams[j];
+    delayBuffers[i].offset = calcDelaySamples( bpm, delayTime );
+    delayBuffers[i].fbGain = calcFbGain( bpm, delayTime );
+  }
 
   float * __restrict x = xn;
   const float * x_e = x + 2*frames;
